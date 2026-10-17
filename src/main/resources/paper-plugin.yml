@@ -1,0 +1,5 @@
+name: GraveKeeper
+version: '${version}'
+main: com.gravekeeper.GraveKeeper
+api-version: '26.3'
+description: Leaves a gravestone when you die that holds your items and XP until you collect them.
