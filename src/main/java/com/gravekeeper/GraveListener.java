@@ -17,6 +17,7 @@ import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockState;
 import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
@@ -35,6 +36,7 @@ import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
+import org.bukkit.event.world.WorldLoadEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
@@ -64,7 +66,8 @@ public final class GraveListener implements Listener {
 
     // ---------------------------------------------------------------- death
 
-    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    // MONITOR: only act on deaths that really happen (another plugin may cancel the death).
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onDeath(PlayerDeathEvent event) {
         Player player = event.getEntity();
 
@@ -91,6 +94,7 @@ public final class GraveListener implements Listener {
         Grave grave = new Grave(UUID.randomUUID(), player.getUniqueId(), player.getName(),
                 world.getUID(), spot.getX(), spot.getY(), spot.getZ(), items, exp, null);
 
+        BlockState original = spot.getState();
         boolean stored = false;
         try {
             spot.setType(GRAVE_BLOCK);
@@ -101,7 +105,8 @@ public final class GraveListener implements Listener {
         }
         if (!stored) {
             // Undo the grave and keep vanilla drops, so nothing is lost or duplicated.
-            removeBlockAndLabel(grave, world);
+            removeLabel(grave, world);
+            original.update(true, false);
             return;
         }
 
@@ -109,7 +114,8 @@ public final class GraveListener implements Listener {
         event.setDroppedExp(0);
 
         player.sendMessage(Component.text("Your items are safe in a gravestone at ", NamedTextColor.GRAY)
-                .append(Component.text(spot.getX() + ", " + spot.getY() + ", " + spot.getZ(), NamedTextColor.YELLOW))
+                .append(Component.text(world.getName() + " " + spot.getX() + ", " + spot.getY() + ", " + spot.getZ(),
+                        NamedTextColor.YELLOW))
                 .append(Component.text(". Right-click it to get them back.", NamedTextColor.GRAY)));
     }
 
@@ -125,8 +131,9 @@ public final class GraveListener implements Listener {
     }
 
     /**
-     * Finds a free, reachable block at or near the death location. Falls back to the
-     * world spawn if the death spot is unusable (void, Nether roof). Null if nothing fits.
+     * Finds a free block at or near the death location. Prefers a reachable one; falls back to
+     * the world spawn, then to any ground in the spawn column. As a last resort it returns an
+     * unreachable spot, because a hard-to-reach grave beats items lost to the void.
      */
     private Block findSpot(Location death) {
         World world = death.getWorld();
@@ -138,15 +145,34 @@ public final class GraveListener implements Listener {
             y = world.getHighestBlockYAt(x, z) + 1;
         }
 
-        Block spot = search(world, x, y, z);
-        if (spot == null || !isReachable(spot)) {
-            Location spawn = world.getSpawnLocation();
-            spot = search(world, spawn.getBlockX(), world.getHighestBlockYAt(spawn) + 1, spawn.getBlockZ());
-            if (spot != null && !isReachable(spot)) {
-                spot = null;
+        Block direct = search(world, x, y, z);
+        if (direct != null && isReachable(direct)) {
+            return direct;
+        }
+        Location spawn = world.getSpawnLocation();
+        Block atSpawn = search(world, spawn.getBlockX(), world.getHighestBlockYAt(spawn) + 1, spawn.getBlockZ());
+        if (atSpawn != null && isReachable(atSpawn)) {
+            return atSpawn;
+        }
+        Block scanned = scanDown(world, spawn.getBlockX(), spawn.getBlockZ());
+        if (scanned != null) {
+            return scanned;
+        }
+        return direct != null ? direct : atSpawn;
+    }
+
+    /** Topmost free block with solid ground below, under the world's logical ceiling (Nether roof). */
+    private Block scanDown(World world, int x, int z) {
+        int top = Math.min(world.getLogicalHeight(), world.getMaxHeight() - 1) - 1;
+        for (int y = top; y > world.getMinHeight() + 1; y--) {
+            Block block = world.getBlockAt(x, y, z);
+            Block below = block.getRelative(0, -1, 0);
+            if (isFree(block) && block.getType() != Material.LAVA && store.at(block) == null
+                    && !below.isEmpty() && below.getType() != Material.LAVA) {
+                return block;
             }
         }
-        return spot;
+        return null;
     }
 
     private Block search(World world, int x, int y, int z) {
@@ -220,10 +246,12 @@ public final class GraveListener implements Listener {
             return;
         }
 
+        boolean changed = grave.exp > 0;
         if (grave.exp > 0) {
             player.giveExp(grave.exp);
             grave.exp = 0;
         }
+        int before = totalAmount(grave.items);
 
         PlayerInventory inventory = player.getInventory();
         List<ItemStack> leftover = new ArrayList<>();
@@ -234,10 +262,22 @@ public final class GraveListener implements Listener {
             leftover.addAll(inventory.addItem(item).values());
         }
         grave.items = leftover;
+        changed |= totalAmount(leftover) < before;
+
+        if (!changed && !leftover.isEmpty()) {
+            player.sendMessage(Component.text(
+                    "Your inventory is full. Make some room and right-click the gravestone again - the items are still safe.",
+                    NamedTextColor.YELLOW));
+            return;
+        }
 
         // Get the items onto the player's disk data before the grave forgets them, so a
         // crash in between can't lose them.
-        player.saveData();
+        try {
+            player.saveData();
+        } catch (RuntimeException e) {
+            plugin.getLogger().log(Level.WARNING, "Could not save player data for " + player.getName(), e);
+        }
 
         boolean done = leftover.isEmpty();
         boolean saved = done ? store.remove(grave) : store.save();
@@ -260,6 +300,14 @@ public final class GraveListener implements Listener {
                     "Your inventory is full. Make some room and right-click the gravestone again - the rest is still safe.",
                     NamedTextColor.YELLOW));
         }
+    }
+
+    private static int totalAmount(List<ItemStack> items) {
+        int total = 0;
+        for (ItemStack item : items) {
+            total += item.getAmount();
+        }
+        return total;
     }
 
     private static boolean equipIfEmptyArmorSlot(PlayerInventory inventory, ItemStack item) {
@@ -288,7 +336,13 @@ public final class GraveListener implements Listener {
         if (block.getType() == GRAVE_BLOCK) {
             block.setType(Material.AIR);
         }
-        Location center = grave.center(world);
+        removeLabel(grave, world);
+    }
+
+    private void removeLabel(Grave grave, World world) {
+        if (world == null) {
+            return;
+        }
         if (grave.label != null) {
             Entity label = Bukkit.getEntity(grave.label);
             if (label != null) {
@@ -297,7 +351,7 @@ public final class GraveListener implements Listener {
         }
         // Also sweep by tag, in case the label's UUID lookup missed it.
         String id = grave.id.toString();
-        for (TextDisplay td : world.getNearbyEntitiesByType(TextDisplay.class, center, 2)) {
+        for (TextDisplay td : world.getNearbyEntitiesByType(TextDisplay.class, grave.center(world), 2)) {
             if (id.equals(td.getPersistentDataContainer().get(labelKey, PersistentDataType.STRING))) {
                 td.remove();
             }
@@ -308,24 +362,66 @@ public final class GraveListener implements Listener {
 
     /**
      * If something outside this plugin (WorldEdit, /fill, ...) removed a grave block, put it
-     * back when its chunk loads, so the items stay reachable.
+     * back when its chunk is loaded so the items stay reachable. If the spot has since been
+     * built over, the grave moves to the nearest free spot.
      */
     @EventHandler
     public void onChunkLoad(ChunkLoadEvent event) {
         Chunk chunk = event.getChunk();
-        World world = chunk.getWorld();
-        for (Grave grave : store.all()) {
-            if (grave.world.equals(world.getUID()) && (grave.x >> 4) == chunk.getX() && (grave.z >> 4) == chunk.getZ()) {
-                Bukkit.getScheduler().runTask(plugin, () -> {
-                    if (!world.isChunkLoaded(chunk.getX(), chunk.getZ())) {
-                        return;
-                    }
-                    Block block = world.getBlockAt(grave.x, grave.y, grave.z);
-                    if (block.getType() != GRAVE_BLOCK && isFree(block)) {
-                        block.setType(GRAVE_BLOCK);
-                    }
-                });
+        UUID world = chunk.getWorld().getUID();
+        for (Grave grave : new ArrayList<>(store.all())) {
+            if (grave.world.equals(world) && (grave.x >> 4) == chunk.getX() && (grave.z >> 4) == chunk.getZ()) {
+                Bukkit.getScheduler().runTask(plugin, () -> restore(grave));
             }
+        }
+    }
+
+    @EventHandler
+    public void onWorldLoad(WorldLoadEvent event) {
+        Bukkit.getScheduler().runTask(plugin, this::restoreAll);
+    }
+
+    /** Checks every grave whose chunk is currently loaded. */
+    void restoreAll() {
+        for (Grave grave : new ArrayList<>(store.all())) {
+            restore(grave);
+        }
+    }
+
+    private void restore(Grave grave) {
+        World world = Bukkit.getWorld(grave.world);
+        if (world == null || !world.isChunkLoaded(grave.x >> 4, grave.z >> 4)) {
+            return;
+        }
+        Block block = world.getBlockAt(grave.x, grave.y, grave.z);
+        // Re-check at run time: the grave may have been collected or moved since this was scheduled.
+        if (block.getType() == GRAVE_BLOCK || store.at(block) != grave) {
+            return;
+        }
+        if (isFree(block)) {
+            block.setType(GRAVE_BLOCK);
+            return;
+        }
+
+        Block spot = search(world, grave.x, grave.y, grave.z);
+        if (spot == null) {
+            plugin.getLogger().warning("Grave " + grave.id + " at " + grave.x + "," + grave.y + "," + grave.z
+                    + " is blocked and no free spot was found; its items are still safe in graves.yml.");
+            return;
+        }
+        removeLabel(grave, world);
+        if (!store.relocate(grave, spot)) {
+            return;
+        }
+        spot.setType(GRAVE_BLOCK);
+        grave.label = spawnLabel(grave, world);
+        store.save();
+
+        plugin.getLogger().info("Moved grave " + grave.id + " to " + spot.getX() + "," + spot.getY() + "," + spot.getZ());
+        Player owner = Bukkit.getPlayer(grave.owner);
+        if (owner != null) {
+            owner.sendMessage(Component.text("Your gravestone was blocked and moved to " + world.getName() + " "
+                    + spot.getX() + ", " + spot.getY() + ", " + spot.getZ() + ".", NamedTextColor.YELLOW));
         }
     }
 

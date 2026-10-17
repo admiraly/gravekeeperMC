@@ -19,7 +19,10 @@ public final class GraveKeeper extends JavaPlugin {
 
         GraveStore store = new GraveStore(this);
         store.load();
-        plugins.registerEvents(new GraveListener(this, store), this);
+        GraveListener listener = new GraveListener(this, store);
+        plugins.registerEvents(listener, this);
+        // Chunks loaded before we enabled (spawn area) never fire ChunkLoadEvent for us.
+        getServer().getScheduler().runTask(this, listener::restoreAll);
     }
 
     @Override

@@ -15,7 +15,8 @@ public final class Grave {
     final UUID owner;
     final String ownerName;
     final UUID world;
-    final int x, y, z;
+    /** Mutable only so a grave can be relocated if its spot gets built over (see GraveStore#relocate). */
+    int x, y, z;
 
     List<ItemStack> items;
     int exp;

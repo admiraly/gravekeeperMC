@@ -2,9 +2,11 @@ package com.gravekeeper;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -36,6 +38,7 @@ public final class GraveStore {
     private final File backup;
     private final File temp;
     private final Map<String, Grave> graves = new LinkedHashMap<>();
+    private boolean keepBackup;
     /** Raw data of graves we could not parse, preserved so a save never deletes them. */
     private final Map<String, Map<String, Object>> unreadable = new LinkedHashMap<>();
 
@@ -83,13 +86,36 @@ public final class GraveStore {
         return false;
     }
 
+    /** Moves a grave to a new block in the same world and persists it; reverts on failure. */
+    boolean relocate(Grave grave, Block to) {
+        String oldKey = grave.key();
+        int ox = grave.x, oy = grave.y, oz = grave.z;
+        graves.remove(oldKey);
+        grave.x = to.getX();
+        grave.y = to.getY();
+        grave.z = to.getZ();
+        graves.put(grave.key(), grave);
+        if (save()) {
+            return true;
+        }
+        graves.remove(grave.key());
+        grave.x = ox;
+        grave.y = oy;
+        grave.z = oz;
+        graves.put(oldKey, grave);
+        return false;
+    }
+
     void load() {
         YamlConfiguration yaml = read(file);
         if (yaml == null && file.exists()) {
             File bad = new File(plugin.getDataFolder(), "graves.yml.corrupt-" + System.currentTimeMillis());
             plugin.getLogger().severe("graves.yml is unreadable; moving it to " + bad.getName()
                     + " and trying graves.yml.bak");
-            file.renameTo(bad);
+            if (!file.renameTo(bad)) {
+                // Don't let the next save overwrite a good backup with this corrupt file.
+                keepBackup = true;
+            }
             yaml = read(backup);
         }
         if (yaml == null) {
@@ -110,6 +136,7 @@ public final class GraveStore {
                         ? new ArrayList<>()
                         : new ArrayList<>(Arrays.asList(
                                 ItemStack.deserializeItemsFromBytes(Base64.getDecoder().decode(encoded))));
+                items.removeIf(i -> i == null || i.getType().isAir());
                 String label = s.getString("label");
                 Grave grave = new Grave(
                         UUID.fromString(id),
@@ -120,7 +147,11 @@ public final class GraveStore {
                         items,
                         s.getInt("exp"),
                         label == null ? null : UUID.fromString(label));
-                graves.put(grave.key(), grave);
+                if (graves.putIfAbsent(grave.key(), grave) != null) {
+                    // Two graves claim the same spot (hand-edited file?): keep both, never drop one.
+                    unreadable.put(id, s.getValues(false));
+                    plugin.getLogger().severe("Grave " + id + " shares a position with another grave; preserved untouched.");
+                }
             } catch (RuntimeException e) {
                 unreadable.put(id, s.getValues(false));
                 plugin.getLogger().log(Level.SEVERE,
@@ -165,7 +196,10 @@ public final class GraveStore {
             }
             plugin.getDataFolder().mkdirs();
             yaml.save(temp);
-            if (file.exists()) {
+            try (FileChannel channel = FileChannel.open(temp.toPath(), StandardOpenOption.WRITE)) {
+                channel.force(true);
+            }
+            if (file.exists() && !keepBackup) {
                 Files.copy(file.toPath(), backup.toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
             try {
@@ -174,6 +208,7 @@ public final class GraveStore {
             } catch (AtomicMoveNotSupportedException e) {
                 Files.move(temp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
+            keepBackup = false;
             return true;
         } catch (IOException | RuntimeException e) {
             plugin.getLogger().log(Level.SEVERE, "Could not save graves.yml - gravestones may be lost on restart!", e);
